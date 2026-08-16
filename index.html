@@ -195,7 +195,7 @@
     text-align:center;
     padding:34px 24px 10px;
   }
-  .score-hero .report-label{font-size:12.5px;color:var(--navy);font-weight:700;letter-spacing:.08em;text-transform:uppercase;margin-bottom:10px;}
+  .score-hero .report-label{font-size:25px;color:var(--navy);font-weight:700;letter-spacing:.08em;text-transform:uppercase;margin-bottom:10px;}
   .score-hero .big{font-size:52px;font-weight:800;color:var(--navy);line-height:1;}
   .score-hero .pct{font-size:16px;color:var(--gray-500);margin-top:6px;}
   .score-hero .pass{display:inline-block;margin-top:14px;padding:5px 16px;border-radius:20px;font-weight:700;font-size:12.5px;}
@@ -965,7 +965,10 @@ function renderReview(app){
   card.appendChild(el('div',{class:'pad'},[
     el('h1',{},['Answer review']),
     el('div',{class:'subtitle'},[`${session.candidateName} · ${rangeLabel}`]),
-    el('button',{class:'btn btn-outline', onclick: ()=>{ state.screen='setup'; render(); }},['← Back to menu'])
+    el('div',{class:'btn-row', style:'margin-top:0;'},[
+      el('button',{class:'btn btn-outline', onclick: ()=>{ state.screen='finished'; render(); }},['← Back to results']),
+      el('button',{class:'btn btn-outline', onclick: ()=>{ state.screen='setup'; render(); }},['Back to menu'])
+    ])
   ]));
   const list = el('div',{class:'review-list'});
   session.order.forEach(qn=>{
