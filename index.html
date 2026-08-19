@@ -379,6 +379,7 @@ QUESTIONS.forEach(q => QMAP[q.n] = q);
 const SESSION_KEY = 'sy0701-active-session';
 const HISTORY_KEY = 'sy0701-history';
 const AUTH_KEY = 'sy0701-authed';
+const WRONG_POOL_KEY = 'sy0701-wrong-pool';
 
 // ---------------------------------------------------------------------------
 // SHARED ACCESS CODE — change this to whatever you want the group password
@@ -392,10 +393,17 @@ let state = {
   screen: 'loading', // loading | gate | setup | exam | finished | history
   session: null,
   historyList: [],
+  wrongPool: [],
   loadError: null
 };
 
 function letterOf(i){ return String.fromCharCode(65+i); }
+
+function rangeLabelFor(isWrongPool, isRetake, rangeStart, rangeEnd, count){
+  if(isWrongPool) return `All-time missed \u00b7 ${count} question${count===1?'':'s'}`;
+  if(isRetake) return `Retake \u00b7 ${count} question${count===1?'':'s'} (incorrect & skipped)`;
+  return `Questions ${rangeStart}\u2013${rangeEnd}`;
+}
 
 function parseAnswerLetters(a){
   if(!a) return [];
@@ -472,6 +480,20 @@ async function saveHistory(list){
     await storageBackend.set(HISTORY_KEY, JSON.stringify(list.slice(0,100)), false);
   }catch(e){ console.error('save history failed', e); }
 }
+async function loadWrongPool(){
+  try{
+    const r = await storageBackend.get(WRONG_POOL_KEY, false);
+    const arr = r ? JSON.parse(r.value) : [];
+    // Defensive filter: drop any question number that no longer exists or
+    // has no selectable choices (e.g. if the bank ever changes).
+    return arr.filter(n => QMAP[n] && QMAP[n].o && QMAP[n].o.length > 0);
+  }catch(e){ return []; }
+}
+async function saveWrongPool(arr){
+  try{
+    await storageBackend.set(WRONG_POOL_KEY, JSON.stringify(arr), false);
+  }catch(e){ console.error('save wrong pool failed', e); }
+}
 async function checkAuthed(){
   try{
     const r = await storageBackend.get(AUTH_KEY, false);
@@ -520,6 +542,7 @@ function renderGate(app){
       await setAuthed();
       state.session = await loadSession();
       state.historyList = await loadHistory();
+      state.wrongPool = await loadWrongPool();
       state.screen = 'setup';
       render();
     } else {
@@ -550,9 +573,7 @@ function renderSetup(app){
   if(state.session && !state.session.completed){
     const s = state.session;
     const answered = Object.values(s.answers||{}).filter(a=>a.selected && a.selected.length>0).length;
-    const rangeLabel = s.isRetake
-      ? `Retake · ${s.order.length} question${s.order.length===1?'':'s'} (incorrect & skipped)`
-      : `Questions ${s.rangeStart}–${s.rangeEnd}`;
+    const rangeLabel = rangeLabelFor(s.isWrongPool, s.isRetake, s.rangeStart, s.rangeEnd, s.order.length);
     const box = el('div',{class:'resume-box'},[
       el('div',{class:'title'},[`Resume in progress: ${s.candidateName || 'Unnamed'}`]),
       el('div',{class:'sub'},[`${rangeLabel} · ${answered}/${s.order.length} answered · currently at Q${s.order[s.currentIndex]}`]),
@@ -656,6 +677,47 @@ function renderSetup(app){
 
   card.appendChild(pad);
   app.appendChild(card);
+
+  if(state.wrongPool && state.wrongPool.length > 0){
+    const wrongCard = el('div',{class:'card'});
+    const wrongPad = el('div',{class:'pad'});
+    wrongPad.appendChild(el('h2',{style:'margin-bottom:2px;'},[`All-Time Missed Questions (${state.wrongPool.length})`]));
+    wrongPad.appendChild(el('div',{class:'subtitle'},[
+      "Every question you've gotten wrong or skipped, across every exam you've ever taken. Answering one correctly removes it from this list automatically."
+    ]));
+    wrongPad.appendChild(el('div',{class:'btn-row'},[
+      el('button',{class:'btn btn-primary', onclick: async ()=>{
+        const nameVal = nameInput.value.trim();
+        if(!nameVal){ errDiv.textContent = 'Please enter the candidate name.'; errDiv.style.display='block'; return; }
+        const order = state.wrongPool.slice();
+        const wrongSession = {
+          candidateName: nameVal,
+          rangeStart: Math.min(...order),
+          rangeEnd: Math.max(...order),
+          isWrongPool: true,
+          order: order,
+          currentIndex: 0,
+          answers: {},
+          flags: {},
+          startedAt: new Date().toISOString(),
+          completed: false
+        };
+        state.session = wrongSession;
+        await saveSession(wrongSession);
+        state.screen = 'exam';
+        render();
+      }},[`Practice All-Time Missed Questions (${state.wrongPool.length})`]),
+      el('button',{class:'btn btn-outline', onclick: async ()=>{
+        if(confirm("Clear your all-time missed-questions list? This can't be undone.")){
+          state.wrongPool = [];
+          await saveWrongPool([]);
+          render();
+        }
+      }},['Clear list'])
+    ]));
+    wrongCard.appendChild(wrongPad);
+    app.appendChild(wrongCard);
+  }
 
   const histCard = el('div',{class:'card'},[
     el('div',{class:'pad', style:'display:flex;justify-content:space-between;align-items:center;'},[
@@ -888,6 +950,11 @@ async function finishExam(){
 
   let correct=0, incorrect=0, skipped=0;
   const catStats = {};
+  // Keep the persistent all-time "missed questions" pool in sync with this
+  // result: anything gotten wrong or skipped goes in (or stays in); anything
+  // answered correctly comes out. This runs after every completed exam,
+  // regardless of what kind of session it was.
+  const pool = new Set(state.wrongPool || []);
   s.order.forEach(qn=>{
     const q = QMAP[qn];
     const rec = s.answers[qn];
@@ -897,17 +964,20 @@ async function finishExam(){
     // No answer was ever picked (whether the question was left untouched, or
     // revealed via Next Question / Show Answer without a selection) counts as
     // skipped, not incorrect — "checked" only means the answer was viewed.
-    if(!rec || sel.length===0){ skipped++; return; }
+    if(!rec || sel.length===0){ skipped++; pool.add(qn); return; }
     const letters = parseAnswerLetters(q.a);
-    if(arraysEqualAsSets(sel, letters)){ correct++; catStats[q.c].correct++; }
-    else { incorrect++; }
+    if(arraysEqualAsSets(sel, letters)){ correct++; catStats[q.c].correct++; pool.delete(qn); }
+    else { incorrect++; pool.add(qn); }
   });
+  state.wrongPool = Array.from(pool).sort((a,b)=>a-b);
+  await saveWrongPool(state.wrongPool);
 
   const summary = {
     candidateName: s.candidateName,
     rangeStart: s.rangeStart,
     rangeEnd: s.rangeEnd,
     isRetake: !!s.isRetake,
+    isWrongPool: !!s.isWrongPool,
     total: s.order.length,
     correct, incorrect, skipped,
     date: new Date().toISOString()
@@ -929,9 +999,7 @@ function renderFinished(app){
   const {summary, catStats, session} = r;
   const pct = summary.total>0 ? Math.round((summary.correct/summary.total)*100) : 0;
   const passed = pct >= 75;
-  const rangeText = summary.isRetake
-    ? `Retake · ${summary.total} question${summary.total===1?'':'s'} (incorrect & skipped)`
-    : `Questions ${summary.rangeStart}–${summary.rangeEnd}`;
+  const rangeText = rangeLabelFor(summary.isWrongPool, summary.isRetake, summary.rangeStart, summary.rangeEnd, summary.total);
 
   const card = el('div',{class:'card'});
   const hero = el('div',{class:'score-hero'},[
@@ -1012,9 +1080,7 @@ function renderFinished(app){
 function renderReview(app){
   app.innerHTML = '';
   const session = state.reviewSession;
-  const rangeLabel = session.isRetake
-    ? `Retake · ${session.order.length} question${session.order.length===1?'':'s'}`
-    : `Questions ${session.rangeStart}–${session.rangeEnd}`;
+  const rangeLabel = rangeLabelFor(session.isWrongPool, session.isRetake, session.rangeStart, session.rangeEnd, session.order.length);
   const card = el('div',{class:'card'});
   card.appendChild(el('div',{class:'pad'},[
     el('h1',{},['Answer review']),
@@ -1063,7 +1129,7 @@ function renderHistory(app){
     state.historyList.forEach(h=>{
       const pct = h.total>0 ? Math.round((h.correct/h.total)*100) : 0;
       const d = new Date(h.date);
-      const rangeLabel = h.isRetake ? `Retake · ${h.total} questions` : `Q${h.rangeStart}–${h.rangeEnd}`;
+      const rangeLabel = rangeLabelFor(h.isWrongPool, h.isRetake, h.rangeStart, h.rangeEnd, h.total);
       listWrap.appendChild(el('div',{class:'history-item'},[
         el('div',{},[
           el('div',{class:'name'},[h.candidateName]),
@@ -1087,6 +1153,7 @@ async function init(){
   }
   state.session = await loadSession();
   state.historyList = await loadHistory();
+  state.wrongPool = await loadWrongPool();
   state.screen = 'setup';
   render();
 }
