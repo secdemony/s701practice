@@ -480,19 +480,73 @@ async function saveHistory(list){
     await storageBackend.set(HISTORY_KEY, JSON.stringify(list.slice(0,100)), false);
   }catch(e){ console.error('save history failed', e); }
 }
+// ---------------------------------------------------------------------------
+// ALL-TIME MISSED-QUESTION POOL
+//
+// The pool is CUMULATIVE and ADDITIVE. Every question answered incorrectly or
+// left unanswered — in any run, across any number of runs, including runs that
+// are abandoned part-way through — is added and STAYS in the list. Nothing is
+// ever removed automatically; the only things that take a question out are the
+// explicit user actions ("Clear list", or "Remove correct from missed list"
+// on the results screen).
+// ---------------------------------------------------------------------------
+
+// Coerce to unique, valid, sorted question numbers. Guards against legacy data
+// saved as strings, duplicates, and question numbers that no longer exist or
+// have no selectable choices (e.g. if the bank ever changes).
+function normalizeWrongPool(arr){
+  const seen = new Set();
+  const out = [];
+  (Array.isArray(arr) ? arr : []).forEach(v => {
+    const n = Number(v);
+    if(!Number.isFinite(n) || seen.has(n)) return;
+    if(!(QMAP[n] && QMAP[n].o && QMAP[n].o.length > 0)) return;
+    seen.add(n);
+    out.push(n);
+  });
+  return out.sort((a,b)=>a-b);
+}
+
 async function loadWrongPool(){
   try{
     const r = await storageBackend.get(WRONG_POOL_KEY, false);
-    const arr = r ? JSON.parse(r.value) : [];
-    // Defensive filter: drop any question number that no longer exists or
-    // has no selectable choices (e.g. if the bank ever changes).
-    return arr.filter(n => QMAP[n] && QMAP[n].o && QMAP[n].o.length > 0);
+    return normalizeWrongPool(r ? JSON.parse(r.value) : []);
   }catch(e){ return []; }
 }
 async function saveWrongPool(arr){
   try{
     await storageBackend.set(WRONG_POOL_KEY, JSON.stringify(arr), false);
   }catch(e){ console.error('save wrong pool failed', e); }
+}
+
+// Merge question numbers into the persistent pool. Never removes. Writes to
+// storage only when something actually changed, so this is cheap enough to
+// call once per graded question. Returns true if the pool grew.
+async function addToWrongPool(qns){
+  const list = Array.isArray(qns) ? qns : [qns];
+  const merged = normalizeWrongPool((state.wrongPool || []).concat(list));
+  if(merged.length === (state.wrongPool || []).length) return false;
+  state.wrongPool = merged;
+  await saveWrongPool(state.wrongPool);
+  return true;
+}
+
+// The only removal path other than a full clear — driven by an explicit click.
+async function removeFromWrongPool(qns){
+  const drop = new Set((Array.isArray(qns) ? qns : [qns]).map(Number));
+  const kept = (state.wrongPool || []).filter(n => !drop.has(n));
+  if(kept.length === (state.wrongPool || []).length) return false;
+  state.wrongPool = kept;
+  await saveWrongPool(state.wrongPool);
+  return true;
+}
+
+// Is this recorded answer a miss (wrong OR never answered)? Empty selection
+// counts as a miss for pool purposes even though it scores as "skipped".
+function isMissedAnswer(qn, rec){
+  const sel = rec && rec.selected ? rec.selected : [];
+  if(sel.length === 0) return true;
+  return !arraysEqualAsSets(sel, parseAnswerLetters(QMAP[qn].a));
 }
 async function checkAuthed(){
   try{
@@ -683,7 +737,7 @@ function renderSetup(app){
     const wrongPad = el('div',{class:'pad'});
     wrongPad.appendChild(el('h2',{style:'margin-bottom:2px;'},[`All-Time Missed Questions (${state.wrongPool.length})`]));
     wrongPad.appendChild(el('div',{class:'subtitle'},[
-      "Every question you've gotten wrong or skipped, across every exam you've ever taken. Answering one correctly removes it from this list automatically."
+      "Every question you've gotten wrong or skipped, accumulated across every exam you've taken on this device — including runs you exited part-way. Questions stay on this list until you remove them yourself."
     ]));
     wrongPad.appendChild(el('div',{class:'btn-row'},[
       el('button',{class:'btn btn-primary', onclick: async ()=>{
@@ -864,14 +918,20 @@ function renderExam(app){
   if(!checked){
     // Show Answer lives in its own container so that on small screens it can be
     // ordered onto its own full-width row above the Previous/Next pair.
-    answerActions.appendChild(el('button',{class:'btn btn-outline', onclick: ()=>{
+    answerActions.appendChild(el('button',{class:'btn btn-outline', onclick: async ()=>{
       s.answers[q.n] = {selected: selected.slice(), checked:true};
-      saveSession(s);
+      // Grade it now and bank the miss immediately, so it survives even if this
+      // run is abandoned instead of finished.
+      if(isMissedAnswer(q.n, s.answers[q.n])) await addToWrongPool(q.n);
+      await saveSession(s);
       render();
     }},['Show Answer']));
     rightActions.appendChild(el('button',{class:'btn btn-primary', onclick: async ()=>{
       const wasCorrect = selected.length>0 && arraysEqualAsSets(selected, letters);
       s.answers[q.n] = {selected: selected.slice(), checked:true};
+      // Same here: a wrong or unanswered question joins the all-time list the
+      // instant it's graded, not at the end of the exam.
+      if(!wasCorrect) await addToWrongPool(q.n);
       if(wasCorrect){
         // Correct: skip the explanation, advance straight to the next question (or finish).
         if(isLast){
@@ -950,11 +1010,15 @@ async function finishExam(){
 
   let correct=0, incorrect=0, skipped=0;
   const catStats = {};
-  // Keep the persistent all-time "missed questions" pool in sync with this
-  // result: anything gotten wrong or skipped goes in (or stays in); anything
-  // answered correctly comes out. This runs after every completed exam,
-  // regardless of what kind of session it was.
-  const pool = new Set(state.wrongPool || []);
+  // Final sweep into the persistent all-time "missed questions" pool. Misses
+  // are normally recorded the moment a question is graded (see the Show Answer
+  // / Next Question handlers) so that abandoned runs still count; this pass is
+  // the backstop that catches anything never reached or never graded.
+  //
+  // IMPORTANT: this is add-only. A question answered correctly here is NOT
+  // pulled out of the pool — the list is a cumulative record of everything
+  // ever missed and only the user clears it.
+  const newMisses = [];
   s.order.forEach(qn=>{
     const q = QMAP[qn];
     const rec = s.answers[qn];
@@ -964,13 +1028,12 @@ async function finishExam(){
     // No answer was ever picked (whether the question was left untouched, or
     // revealed via Next Question / Show Answer without a selection) counts as
     // skipped, not incorrect — "checked" only means the answer was viewed.
-    if(!rec || sel.length===0){ skipped++; pool.add(qn); return; }
+    if(!rec || sel.length===0){ skipped++; newMisses.push(qn); return; }
     const letters = parseAnswerLetters(q.a);
-    if(arraysEqualAsSets(sel, letters)){ correct++; catStats[q.c].correct++; pool.delete(qn); }
-    else { incorrect++; pool.add(qn); }
+    if(arraysEqualAsSets(sel, letters)){ correct++; catStats[q.c].correct++; }
+    else { incorrect++; newMisses.push(qn); }
   });
-  state.wrongPool = Array.from(pool).sort((a,b)=>a-b);
-  await saveWrongPool(state.wrongPool);
+  await addToWrongPool(newMisses);
 
   const summary = {
     candidateName: s.candidateName,
@@ -1042,9 +1105,23 @@ function renderFinished(app){
     return !arraysEqualAsSets(sel, letters); // incorrect
   });
 
+  // Questions in this run that are on the all-time missed list but were
+  // answered correctly here. The list is never pruned automatically, so this
+  // gives a targeted way to retire ones that have been mastered.
+  const wrongPoolSet = new Set(state.wrongPool || []);
+  const masteredNums = session.order.filter(qn => wrongPoolSet.has(qn) && !isMissedAnswer(qn, session.answers[qn]));
+
   const leftBtns = [
     el('button',{class:'btn btn-outline', onclick: ()=>{ state.screen='review'; state.reviewSession = session; render(); }},['Review answers'])
   ];
+  if(masteredNums.length > 0){
+    leftBtns.push(el('button',{class:'btn btn-outline', onclick: async ()=>{
+      if(confirm(`Remove ${masteredNums.length} question${masteredNums.length===1?'':'s'} you answered correctly from your all-time missed list?`)){
+        await removeFromWrongPool(masteredNums);
+        render();
+      }
+    }},[`Remove ${masteredNums.length} Correct from Missed List`]));
+  }
   if(retakeNums.length > 0){
     leftBtns.push(el('button',{class:'btn btn-outline', onclick: async ()=>{
       const retakeSession = {
