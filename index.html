@@ -80,6 +80,10 @@
   .btn-block{width:100%;}
   .btn-row{display:flex;gap:10px;margin-top:18px;flex-wrap:wrap;}
   .helper{font-size:14px;color:var(--gray-500);margin:4px 0 16px;}
+  .domain-weight-list{display:flex;flex-direction:column;gap:6px;margin:10px 0 16px;}
+  .domain-weight-row{display:flex;justify-content:space-between;gap:12px;padding:8px 12px;background:var(--gray-100,#f3f4f6);border-radius:7px;font-size:13.5px;}
+  .domain-weight-row .dname{color:#111827;}
+  .domain-weight-row .dcount{color:#4b5563;font-weight:600;white-space:nowrap;}
   .err{color:var(--red);font-size:14.5px;margin:4px 0 14px;}
 
   /* header bar */
@@ -96,6 +100,8 @@
   .topbar .qnum{font-weight:700;font-size:17px;}
   .topbar .cat{font-size:13px;color:#c7d2fe;font-style:italic;}
   .topbar .meta{font-size:13.5px;color:#cbd5e1;}
+  .meta-wrap{display:flex;flex-direction:column;align-items:flex-end;gap:2px;}
+  .exam-timer{font-size:14px;font-weight:700;color:#fff;font-variant-numeric:tabular-nums;letter-spacing:.02em;}
 
   /* progress bar */
   .progress-wrap{background:var(--gray-200);height:6px;width:100%;}
@@ -294,6 +300,7 @@
     .topbar .qnum{font-size:16px;}
     .topbar .cat{font-size:12.5px;}
     .topbar .meta{font-size:12.5px;}
+    .exam-timer{font-size:13px;}
 
     .qtext{margin:18px 16px 8px;font-size:17.5px;line-height:1.6;}
     .qhint{margin:0 16px 14px;font-size:13.5px;}
@@ -407,11 +414,78 @@ const TOTAL_Q = QUESTIONS.length;
 // bank has gaps (performance-based items numbered above the sequential range),
 // so every range bound is driven off this rather than off the count.
 const MAX_QN = QUESTIONS.reduce((m,q)=>Math.max(m, q.n), 0);
+
+// ---------------------------------------------------------------------------
+// DOMAIN WEIGHTING (for the 90-question weighted practice exam)
+//
+// The bank's `c` field holds free-form category labels rather than the five
+// official SY0-701 domain numbers, and a couple of labels (risk-related,
+// control-type) don't literally match a domain name. CATEGORY_DOMAIN maps
+// every label actually present in the bank to the domain it belongs to.
+// If a future edit adds a brand-new category string, it falls through to
+// domain 1 rather than silently vanishing from every weighted draw.
+// ---------------------------------------------------------------------------
+const CATEGORY_DOMAIN = {
+  'General Security Concepts': 1,
+  'Security Controls': 1,                              // control types/categories are a 1.x objective
+  'Threats, Vulnerabilities, and Mitigations': 2,
+  'Security Architecture': 3,
+  'Security Operations': 4,
+  'Security Program Management and Oversight': 5,
+  'Risk Management': 5,                                 // risk treatment/registers fall under domain 5
+  'Risk Management and Privacy': 5
+};
+function domainOf(q){ return CATEGORY_DOMAIN[q.c] || 1; }
+
+// Target counts are pre-computed from the stated percentages against a fixed
+// 90-question exam (28/22/20/18/12% of 90 = 25.2/19.8/18/16.2/10.8, rounded to
+// 25/20/18/16/11 — which sums to exactly 90) rather than computed at draw time,
+// so the breakdown shown to the user always matches what gets drawn.
+const DOMAIN_WEIGHTS = [
+  {num:1, name:'General Security Concepts', pct:12, target:11},
+  {num:2, name:'Threats, Vulnerabilities, and Mitigations', pct:22, target:20},
+  {num:3, name:'Security Architecture', pct:18, target:16},
+  {num:4, name:'Security Operations', pct:28, target:25},
+  {num:5, name:'Security Program Management and Oversight', pct:20, target:18}
+];
+
+function shuffled(arr){
+  const a = arr.slice();
+  for(let i=a.length-1;i>0;i--){
+    const j = Math.floor(Math.random()*(i+1));
+    [a[i],a[j]] = [a[j],a[i]];
+  }
+  return a;
+}
+
+// Draws a 90-question set proportioned to DOMAIN_WEIGHTS. Returns both the
+// final shuffled order and a per-domain {picked, target} tally so the UI can
+// flag it plainly if a domain's pool ever runs short (it currently never
+// does — every pool has well over 4x its target — but the bank could shrink).
+function buildWeightedOrder(){
+  const tally = [];
+  let combined = [];
+  DOMAIN_WEIGHTS.forEach(d=>{
+    const pool = [];
+    for(let n=1;n<=MAX_QN;n++){
+      const q = QMAP[n];
+      if(q && isPracticable(q) && domainOf(q) === d.num) pool.push(n);
+    }
+    const picked = shuffled(pool).slice(0, d.target);
+    tally.push({num:d.num, name:d.name, target:d.target, picked:picked.length});
+    combined = combined.concat(picked);
+  });
+  return {order: shuffled(combined), tally};
+}
+
 const QMAP = {};
 QUESTIONS.forEach(q => QMAP[q.n] = q);
 
 const SESSION_KEY = 'sy0701-active-session';
 const HISTORY_KEY = 'sy0701-history';
+// The minimum percentage correct required for a practice run to be marked as
+// passing on the results screen and in the past-results list.
+const PASS_THRESHOLD = 82;
 const AUTH_KEY = 'sy0701-authed';
 const WRONG_POOL_KEY = 'sy0701-wrong-pool';
 
@@ -433,15 +507,26 @@ let state = {
 
 function letterOf(i){ return String.fromCharCode(65+i); }
 
-function rangeLabelFor(isWrongPool, isRetake, rangeStart, rangeEnd, count){
+function rangeLabelFor(isWrongPool, isRetake, rangeStart, rangeEnd, count, isWeighted){
   if(isWrongPool) return `All-time missed \u00b7 ${count} question${count===1?'':'s'}`;
   if(isRetake) return `Retake \u00b7 ${count} question${count===1?'':'s'} (incorrect & skipped)`;
+  if(isWeighted) return `Weighted exam \u00b7 ${count} questions (by domain %)`;
   return `Questions ${rangeStart}\u2013${rangeEnd}`;
 }
 
 function parseAnswerLetters(a){
   if(!a) return [];
   return a.split(/[,\s]+/).filter(Boolean);
+}
+
+// Formats a millisecond duration as H:MM:SS (or M:SS under an hour).
+function formatDuration(ms){
+  const totalSec = Math.max(0, Math.round(ms/1000));
+  const h = Math.floor(totalSec/3600);
+  const m = Math.floor((totalSec%3600)/60);
+  const s = totalSec%60;
+  const pad = n => String(n).padStart(2,'0');
+  return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -647,7 +732,16 @@ async function clearAuthed(){
   try{ await storageBackend.delete(AUTH_KEY, false); }catch(e){}
 }
 
+// Handle for the exam screen's live-ticking clock. It updates its own DOM node
+// on a 1s interval rather than going through the full render() cycle, since a
+// full re-render every second would rebuild dropdowns/inputs and could disturb
+// in-progress selections. Every render() pass clears it first: if the exam
+// screen is being (re)drawn, renderExam() starts a fresh one pointed at the
+// new node; if we've navigated away, the old node is simply gone.
+let examTimerInterval = null;
+
 function render(){
+  if(examTimerInterval){ clearInterval(examTimerInterval); examTimerInterval = null; }
   const app = document.getElementById('app');
   app.innerHTML = '';
   if(state.screen === 'loading'){
@@ -713,7 +807,7 @@ function renderSetup(app){
   if(state.session && !state.session.completed){
     const s = state.session;
     const answered = s.order.filter(qn => hasResponse(QMAP[qn], (s.answers||{})[qn])).length;
-    const rangeLabel = rangeLabelFor(s.isWrongPool, s.isRetake, s.rangeStart, s.rangeEnd, s.order.length);
+    const rangeLabel = rangeLabelFor(s.isWrongPool, s.isRetake, s.rangeStart, s.rangeEnd, s.order.length, s.isWeighted);
     const box = el('div',{class:'resume-box'},[
       el('div',{class:'title'},[`Resume in progress: ${s.candidateName || 'Unnamed'}`]),
       el('div',{class:'sub'},[`${rangeLabel} · ${answered}/${s.order.length} answered · currently at Q${s.order[s.currentIndex]}`]),
@@ -817,6 +911,56 @@ function renderSetup(app){
   card.appendChild(pad);
   app.appendChild(card);
 
+  // ---- Weighted 90-question practice exam (proportioned to domain weights) ----
+  const weightedCard = el('div',{class:'card'});
+  const weightedPad = el('div',{class:'pad'});
+  weightedPad.appendChild(el('h2',{style:'margin-bottom:2px;'},['Weighted Practice Exam (90 Questions)']));
+  weightedPad.appendChild(el('div',{class:'subtitle'},[
+    'Randomly draws 90 questions proportioned to the official SY0-701 domain weights, then shuffles the mix.'
+  ]));
+  const weightRows = el('div',{class:'domain-weight-list'}, DOMAIN_WEIGHTS.map(d=>
+    el('div',{class:'domain-weight-row'},[
+      el('span',{class:'dname'},[d.name]),
+      el('span',{class:'dcount'},[`${d.pct}% · ${d.target}q`])
+    ])
+  ));
+  weightedPad.appendChild(weightRows);
+  weightedPad.appendChild(el('div',{class:'btn-row'},[
+    el('button',{class:'btn btn-primary', onclick: async ()=>{
+      const nameVal = nameInput.value.trim();
+      if(!nameVal){ errDiv.textContent = 'Please enter the candidate name.'; errDiv.style.display='block'; return; }
+      const {order, tally} = buildWeightedOrder();
+      const short = tally.filter(t => t.picked < t.target);
+      if(short.length){
+        // Extremely unlikely at current bank size (see buildWeightedOrder), but
+        // if a domain's pool is ever smaller than its target, say so plainly
+        // rather than silently handing back a shorter exam.
+        errDiv.textContent = 'Not enough practicable questions in: ' +
+          short.map(t=>`${t.name} (${t.picked}/${t.target})`).join(', ') + '.';
+        errDiv.style.display='block';
+        return;
+      }
+      const weightedSession = {
+        candidateName: nameVal,
+        rangeStart: null,
+        rangeEnd: null,
+        isWeighted: true,
+        order: order,
+        currentIndex: 0,
+        answers: {},
+        flags: {},
+        startedAt: new Date().toISOString(),
+        completed: false
+      };
+      state.session = weightedSession;
+      await saveSession(weightedSession);
+      state.screen = 'exam';
+      render();
+    }},['Start Weighted Exam (90 Q)'])
+  ]));
+  weightedCard.appendChild(weightedPad);
+  app.appendChild(weightedCard);
+
   if(state.wrongPool && state.wrongPool.length > 0){
     const wrongCard = el('div',{class:'card'});
     const wrongPad = el('div',{class:'pad'});
@@ -889,14 +1033,26 @@ function renderExam(app){
   const card = el('div',{class:'card'});
 
   // top bar
+  const timerEl = el('div',{class:'exam-timer'},[formatDuration(Date.now() - new Date(s.startedAt).getTime())]);
   const topbar = el('div',{class:'topbar'},[
     el('div',{},[
       el('div',{class:'qnum'},[`Question ${q.n}`]),
       el('div',{class:'cat'},[q.c])
     ]),
-    el('div',{class:'meta'},[`${s.candidateName} · ${s.currentIndex+1} of ${s.order.length}`])
+    el('div',{class:'meta-wrap'},[
+      timerEl,
+      el('div',{class:'meta'},[`${s.candidateName} · ${s.currentIndex+1} of ${s.order.length}`])
+    ])
   ]);
   card.appendChild(topbar);
+
+  // Live-tick the timer once a second without a full re-render. startedAt is
+  // set when the session was created and persists across save/resume, so the
+  // clock reflects true elapsed time even if the candidate left and came back.
+  const startedMs = new Date(s.startedAt).getTime();
+  examTimerInterval = setInterval(()=>{
+    timerEl.textContent = formatDuration(Date.now() - startedMs);
+  }, 1000);
 
   const pct = Math.round(((s.currentIndex) / s.order.length) * 100);
   card.appendChild(el('div',{class:'progress-wrap'},[el('div',{class:'progress-fill', style:`width:${pct}%`})]));
@@ -1200,6 +1356,11 @@ async function finishExam(){
   const s = state.session;
   s.completed = true;
   s.finishedAt = new Date().toISOString();
+  // Elapsed wall-clock time from the moment the session was created to now.
+  // startedAt already persists across save/resume (it's set once, at session
+  // creation, and never touched again), so this is true elapsed time even if
+  // the candidate left mid-exam and came back later.
+  const durationMs = Date.now() - new Date(s.startedAt).getTime();
   await saveSession(s);
 
   let correct=0, incorrect=0, skipped=0;
@@ -1233,8 +1394,10 @@ async function finishExam(){
     rangeEnd: s.rangeEnd,
     isRetake: !!s.isRetake,
     isWrongPool: !!s.isWrongPool,
+    isWeighted: !!s.isWeighted,
     total: s.order.length,
     correct, incorrect, skipped,
+    durationMs,
     date: new Date().toISOString()
   };
   state.historyList.unshift(summary);
@@ -1253,15 +1416,15 @@ function renderFinished(app){
   if(!r){ state.screen='setup'; render(); return; }
   const {summary, catStats, session} = r;
   const pct = summary.total>0 ? Math.round((summary.correct/summary.total)*100) : 0;
-  const passed = pct >= 75;
-  const rangeText = rangeLabelFor(summary.isWrongPool, summary.isRetake, summary.rangeStart, summary.rangeEnd, summary.total);
+  const passed = pct >= PASS_THRESHOLD;
+  const rangeText = rangeLabelFor(summary.isWrongPool, summary.isRetake, summary.rangeStart, summary.rangeEnd, summary.total, summary.isWeighted);
 
   const card = el('div',{class:'card'});
   const hero = el('div',{class:'score-hero'},[
     el('div',{class:'report-label'},['Final Report']),
     el('div',{class:'subtitle', style:'margin-bottom:0;'},[`Candidate: ${summary.candidateName}`]),
     el('div',{class:'big'},[pct+'%']),
-    el('div',{class:'pct'},[`${summary.correct} of ${summary.total} correct · ${rangeText}`]),
+    el('div',{class:'pct'},[`${summary.correct} of ${summary.total} correct · ${rangeText}${summary.durationMs != null ? ' · Time: ' + formatDuration(summary.durationMs) : ''}`]),
     el('div',{class:'pass ' + (passed?'yes':'no')},[passed ? 'Practice score: on track' : 'Practice score: needs review'])
   ]);
   card.appendChild(hero);
@@ -1342,7 +1505,7 @@ function renderFinished(app){
 function renderReview(app){
   app.innerHTML = '';
   const session = state.reviewSession;
-  const rangeLabel = rangeLabelFor(session.isWrongPool, session.isRetake, session.rangeStart, session.rangeEnd, session.order.length);
+  const rangeLabel = rangeLabelFor(session.isWrongPool, session.isRetake, session.rangeStart, session.rangeEnd, session.order.length, session.isWeighted);
   const card = el('div',{class:'card'});
   card.appendChild(el('div',{class:'pad'},[
     el('h1',{},['Answer review']),
@@ -1407,13 +1570,13 @@ function renderHistory(app){
     state.historyList.forEach(h=>{
       const pct = h.total>0 ? Math.round((h.correct/h.total)*100) : 0;
       const d = new Date(h.date);
-      const rangeLabel = rangeLabelFor(h.isWrongPool, h.isRetake, h.rangeStart, h.rangeEnd, h.total);
+      const rangeLabel = rangeLabelFor(h.isWrongPool, h.isRetake, h.rangeStart, h.rangeEnd, h.total, h.isWeighted);
       listWrap.appendChild(el('div',{class:'history-item'},[
         el('div',{},[
           el('div',{class:'name'},[h.candidateName]),
-          el('div',{class:'range'},[`${rangeLabel} · ${d.toLocaleDateString()} ${d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}`])
+          el('div',{class:'range'},[`${rangeLabel} · ${d.toLocaleDateString()} ${d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}${h.durationMs != null ? ' · ' + formatDuration(h.durationMs) : ''}`])
         ]),
-        el('div',{class:'score', style:`color:${pct>=75?'#15803d':'#b91c1c'}`},[`${pct}% (${h.correct}/${h.total})`])
+        el('div',{class:'score', style:`color:${pct>=PASS_THRESHOLD?'#15803d':'#b91c1c'}`},[`${pct}% (${h.correct}/${h.total})`])
       ]));
     });
   }
